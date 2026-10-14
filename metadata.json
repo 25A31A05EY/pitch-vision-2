@@ -1,0 +1,9 @@
+{
+  "name": "PitchVision AI",
+  "description": "AI-powered sports ball-tracking, automated camera capture, and cricket analytics with 3D DRS simulator.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
