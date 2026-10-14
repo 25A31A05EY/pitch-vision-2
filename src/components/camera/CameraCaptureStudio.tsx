@@ -2,18 +2,21 @@ import React, { useState, useRef, useEffect } from 'react';
 import {
   Camera,
   RotateCcw,
-  Sliders,
-  CheckCircle2,
   Video,
-  Play,
   Square,
+  Play,
+  Pause,
   Mic,
   Maximize2,
-  ShieldCheck,
   Zap,
   Target,
   Sparkles,
   Volume2,
+  CheckCircle2,
+  AlertCircle,
+  Download,
+  Film,
+  RefreshCw,
 } from 'lucide-react';
 import { Delivery, PitchLength, PitchLine } from '../../types/cricket';
 
@@ -32,11 +35,15 @@ export const CameraCaptureStudio: React.FC<CameraCaptureStudioProps> = ({
   const [isRecording, setIsRecording] = useState(false);
   const [fpsMode, setFpsMode] = useState<60 | 120>(120);
   const [cameraActive, setCameraActive] = useState(false);
+  const [cameraLoading, setCameraLoading] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
+  const [availableDevices, setAvailableDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
+  const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
+
   const [setupStep, setSetupStep] = useState<'guide' | 'calibrate' | 'live'>('live');
   const [isCalibrated, setIsCalibrated] = useState(true);
   const [audioTriggerEnabled, setAudioTriggerEnabled] = useState(true);
-  const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
 
   // Simulated CV Tracking Overlay
   const [trackingActive, setTrackingActive] = useState(false);
@@ -51,37 +58,84 @@ export const CameraCaptureStudio: React.FC<CameraCaptureStudioProps> = ({
   // Phone Level & Gyroscope State
   const [tiltRoll, setTiltRoll] = useState({ pitch: 0.4, roll: -0.2 });
 
+  // Real Video Recording with MediaRecorder
+  const [recordedVideoUrl, setRecordedVideoUrl] = useState<string | null>(null);
+  const [recordedVideosList, setRecordedVideosList] = useState<
+    Array<{ id: string; url: string; timestamp: string; duration: string; speedKmh: number }>
+  >([]);
+  const [isPlayingRecorded, setIsPlayingRecorded] = useState(false);
+
   const videoRef = useRef<HTMLVideoElement>(null);
+  const recordedVideoPlayerRef = useRef<HTMLVideoElement>(null);
   const canvasOverlayRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
   const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
 
-  // Start / Stop physical camera
-  const startCamera = async () => {
+  // Enumerate camera devices
+  const enumerateCameras = async () => {
     try {
-      setCameraError(null);
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((track) => track.stop());
+      if (!navigator.mediaDevices?.enumerateDevices) return;
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoInputs = devices.filter((d) => d.kind === 'videoinput');
+      setAvailableDevices(videoInputs);
+      if (videoInputs.length > 0 && !selectedDeviceId) {
+        setSelectedDeviceId(videoInputs[0].deviceId);
       }
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: facingMode,
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-        },
+    } catch (e) {
+      console.warn('Could not enumerate video devices:', e);
+    }
+  };
+
+  // Start / Stop physical camera
+  const startCamera = async (forceDeviceId?: string) => {
+    setCameraLoading(true);
+    setCameraError(null);
+
+    // Stop existing stream if any
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
+
+    try {
+      const constraints: MediaStreamConstraints = {
+        video: forceDeviceId
+          ? { deviceId: { exact: forceDeviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+          : {
+              facingMode: facingMode,
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+            },
         audio: false,
-      });
+      };
+
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
       streamRef.current = stream;
+
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-        videoRef.current.play();
+        videoRef.current.onloadedmetadata = () => {
+          videoRef.current?.play().catch((err) => console.warn('Video play error:', err));
+        };
       }
+
       setCameraActive(true);
+      setCameraLoading(false);
+      enumerateCameras();
     } catch (err: any) {
-      console.warn('Physical camera unavailable, running CV simulator fallback:', err);
+      console.warn('Device camera could not be accessed:', err);
       setCameraActive(false);
-      setCameraError('Camera access unavailable. Computer vision tracker running in synthetic mode.');
+      setCameraLoading(false);
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        setCameraError('Camera permission was denied. Please allow camera access in your browser settings.');
+      } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+        setCameraError('No camera hardware was detected on this device.');
+      } else {
+        setCameraError(`Camera initialization failed: ${err.message || 'Check browser permissions'}`);
+      }
     }
   };
 
@@ -90,31 +144,105 @@ export const CameraCaptureStudio: React.FC<CameraCaptureStudioProps> = ({
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
     setCameraActive(false);
   };
 
+  // Attach stream to videoRef when stream is available or videoRef mounts
+  useEffect(() => {
+    if (streamRef.current && videoRef.current) {
+      videoRef.current.srcObject = streamRef.current;
+      videoRef.current.play().catch(console.warn);
+    }
+  }, [cameraActive]);
+
+  // Initial attempt to start camera
   useEffect(() => {
     startCamera();
     return () => {
       stopCamera();
       if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        mediaRecorderRef.current.stop();
+      }
     };
   }, [facingMode]);
 
-  // Recording counter
-  useEffect(() => {
-    if (isRecording) {
+  // Start real video recording using MediaRecorder
+  const handleStartRecording = () => {
+    // If camera is not active, try activating first
+    if (!cameraActive || !streamRef.current) {
+      startCamera();
+      return;
+    }
+
+    try {
+      recordedChunksRef.current = [];
+      const stream = streamRef.current;
+
+      // Determine supported mime type
+      let mimeType = 'video/webm';
+      if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) {
+        mimeType = 'video/webm;codecs=vp9';
+      } else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) {
+        mimeType = 'video/webm;codecs=vp8';
+      } else if (MediaRecorder.isTypeSupported('video/mp4')) {
+        mimeType = 'video/mp4';
+      }
+
+      const recorder = new MediaRecorder(stream, { mimeType });
+      recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          recordedChunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onstop = () => {
+        const blob = new Blob(recordedChunksRef.current, { type: mimeType });
+        if (blob.size > 0) {
+          const url = URL.createObjectURL(blob);
+          setRecordedVideoUrl(url);
+
+          const newVideoItem = {
+            id: `rec_${Date.now()}`,
+            url,
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+            duration: `${elapsedSeconds}s`,
+            speedKmh: recentDetection?.speed || 142.4,
+          };
+          setRecordedVideosList((prev) => [newVideoItem, ...prev]);
+
+          // Automatically trigger ball detection & attach recorded video URL
+          triggerDeliveryCapture(undefined, url);
+        }
+      };
+
+      recorder.start(100); // 100ms slice for real-time capture
+      mediaRecorderRef.current = recorder;
+      setIsRecording(true);
+      setElapsedSeconds(0);
+
       recordingTimerRef.current = setInterval(() => {
         setElapsedSeconds((prev) => prev + 1);
       }, 1000);
-    } else {
-      if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
-      setElapsedSeconds(0);
+    } catch (e: any) {
+      console.error('Failed to start MediaRecorder:', e);
+      alert('Could not start video recorder: ' + e.message);
     }
-    return () => {
-      if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
-    };
-  }, [isRecording]);
+  };
+
+  // Stop real video recording
+  const handleStopRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+    }
+    setIsRecording(false);
+  };
 
   // Audio Cue for Delivery Detect
   const playAudioCue = () => {
@@ -136,19 +264,19 @@ export const CameraCaptureStudio: React.FC<CameraCaptureStudioProps> = ({
   };
 
   // Trigger Delivery CV Tracking Simulation
-  const triggerDeliveryCapture = (customSpeed?: number) => {
+  const triggerDeliveryCapture = (customSpeed?: number, videoUrl?: string) => {
     setTrackingActive(true);
     playAudioCue();
 
     // Generate authentic delivery physics
     const speed = customSpeed || Number((136 + Math.random() * 11).toFixed(1));
     const speedMph = Number((speed * 0.621371).toFixed(1));
-    const swingMm = Math.round((Math.random() - 0.45) * 70); // in-swing or out-swing
+    const swingMm = Math.round((Math.random() - 0.45) * 70);
     const spinRpm = Math.round(1800 + Math.random() * 600);
     const lengths: PitchLength[] = ['good_length', 'full', 'back_of_length', 'yorker', 'short'];
     const lines: PitchLine[] = ['off_stump', 'outside_off', 'middle_stump', 'leg_stump'];
 
-    const chosenLength = lengths[Math.floor(Math.random() * (lengths.length - 1))]; // bias to good length
+    const chosenLength = lengths[Math.floor(Math.random() * (lengths.length - 1))];
     const chosenLine = lines[Math.floor(Math.random() * lines.length)];
 
     const delivery: Delivery = {
@@ -174,7 +302,7 @@ export const CameraCaptureStudio: React.FC<CameraCaptureStudioProps> = ({
       shotZone: 'Covers',
       shotAngleDeg: 135,
       shotDistanceM: 24,
-      videoClipUrl: '',
+      videoClipUrl: videoUrl || recordedVideoUrl || '',
       isHighlighted: true,
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     };
@@ -187,10 +315,8 @@ export const CameraCaptureStudio: React.FC<CameraCaptureStudioProps> = ({
       ballCount: delivery.ballNumber,
     });
 
-    // Draw trajectory animation on canvas
     drawTrackingTrajectory(chosenLength, swingMm);
 
-    // Auto-clipped highlight notification
     setTimeout(() => {
       onNewDeliveryCaptured(delivery);
       setTrackingActive(false);
@@ -206,19 +332,13 @@ export const CameraCaptureStudio: React.FC<CameraCaptureStudioProps> = ({
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Bowler hand start
     const startX = canvas.width * 0.48;
     const startY = canvas.height * 0.22;
-
-    // Pitch bounce point
     const bounceX = canvas.width * 0.5 + (swing > 0 ? -15 : 15);
     const bounceY = canvas.height * (len === 'yorker' ? 0.78 : len === 'full' ? 0.72 : 0.65);
-
-    // Stumps arrive point
     const endX = canvas.width * 0.5 + (swing > 0 ? 30 : -25);
     const endY = canvas.height * 0.82;
 
-    // Draw glowing trajectory
     ctx.strokeStyle = '#38bdf8';
     ctx.lineWidth = 4;
     ctx.shadowColor = '#0284c7';
@@ -229,20 +349,17 @@ export const CameraCaptureStudio: React.FC<CameraCaptureStudioProps> = ({
     ctx.quadraticCurveTo((startX + bounceX) / 2, startY + 40, bounceX, bounceY);
     ctx.stroke();
 
-    // Post-bounce trajectory
     ctx.strokeStyle = '#10b981';
     ctx.beginPath();
     ctx.moveTo(bounceX, bounceY);
     ctx.quadraticCurveTo((bounceX + endX) / 2, bounceY + 20, endX, endY);
     ctx.stroke();
 
-    // Bounce impact circle
     ctx.fillStyle = '#ef4444';
     ctx.beginPath();
     ctx.arc(bounceX, bounceY, 6, 0, Math.PI * 2);
     ctx.fill();
 
-    // Clean up after 2.5s
     setTimeout(() => {
       if (canvasOverlayRef.current) {
         const c = canvasOverlayRef.current.getContext('2d');
@@ -264,12 +381,20 @@ export const CameraCaptureStudio: React.FC<CameraCaptureStudioProps> = ({
         <div className="flex items-center gap-2">
           <Camera className="w-4 h-4 text-emerald-400" />
           <span className="text-xs font-bold uppercase tracking-wider text-slate-200">
-            Automated Session Capture
+            Live Device Camera & Video Recording
           </span>
-          <span className="text-xs text-slate-500">·</span>
-          <span className="text-xs font-mono text-emerald-400">
-            {isCalibrated ? 'Tripod Calibrated' : 'Needs Calibration'}
-          </span>
+          <span className="text-slate-600">·</span>
+          {cameraActive ? (
+            <span className="flex items-center gap-1.5 text-xs font-mono text-emerald-400">
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+              Live Camera Online
+            </span>
+          ) : (
+            <span className="flex items-center gap-1.5 text-xs font-mono text-amber-400">
+              <span className="w-2 h-2 rounded-full bg-amber-400" />
+              Camera Standby
+            </span>
+          )}
         </div>
 
         {/* View Mode Buttons */}
@@ -277,9 +402,7 @@ export const CameraCaptureStudio: React.FC<CameraCaptureStudioProps> = ({
           <button
             onClick={() => setSetupStep('guide')}
             className={`px-2.5 py-1 text-xs font-medium rounded-lg transition-colors ${
-              setupStep === 'guide'
-                ? 'bg-slate-700 text-white'
-                : 'text-slate-400 hover:text-slate-200'
+              setupStep === 'guide' ? 'bg-slate-700 text-white' : 'text-slate-400 hover:text-slate-200'
             }`}
           >
             Tripod Guide
@@ -287,9 +410,7 @@ export const CameraCaptureStudio: React.FC<CameraCaptureStudioProps> = ({
           <button
             onClick={() => setSetupStep('calibrate')}
             className={`px-2.5 py-1 text-xs font-medium rounded-lg transition-colors ${
-              setupStep === 'calibrate'
-                ? 'bg-slate-700 text-white'
-                : 'text-slate-400 hover:text-slate-200'
+              setupStep === 'calibrate' ? 'bg-slate-700 text-white' : 'text-slate-400 hover:text-slate-200'
             }`}
           >
             Crease Calibration
@@ -307,7 +428,30 @@ export const CameraCaptureStudio: React.FC<CameraCaptureStudioProps> = ({
         </div>
       </div>
 
-      {/* Tripod Guide Mode (Instructions & Gyro Level) */}
+      {/* Permission or Camera Start Banner if camera is not active */}
+      {!cameraActive && (
+        <div className="p-4 bg-slate-950 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5 text-xs text-slate-300">
+            <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
+            <div>
+              <span className="font-bold text-white block">Camera Access Needed for Live Video Recording</span>
+              <span className="text-slate-400">
+                {cameraError || 'Click below to allow browser camera access and stream live high-FPS video.'}
+              </span>
+            </div>
+          </div>
+          <button
+            onClick={() => startCamera()}
+            disabled={cameraLoading}
+            className="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs uppercase tracking-wider rounded-xl transition-all shadow-lg flex items-center gap-2 shrink-0 cursor-pointer"
+          >
+            <Camera className="w-4 h-4" />
+            {cameraLoading ? 'Starting Camera...' : 'Enable Live Device Camera'}
+          </button>
+        </div>
+      )}
+
+      {/* Tripod Guide Mode */}
       {setupStep === 'guide' && (
         <div className="p-4 bg-slate-950/70 border-b border-slate-800 space-y-3">
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -369,26 +513,45 @@ export const CameraCaptureStudio: React.FC<CameraCaptureStudioProps> = ({
         </div>
       )}
 
-      {/* Camera / Video Viewport Area */}
-      <div className="relative w-full h-[360px] sm:h-[440px] bg-slate-950 overflow-hidden flex items-center justify-center">
-        {/* Real camera video or realistic synthetic background */}
-        {cameraActive ? (
-          <video
-            ref={videoRef}
-            autoPlay
-            playsInline
-            muted
-            className="w-full h-full object-cover"
-          />
-        ) : (
-          <div className="relative w-full h-full flex flex-col items-center justify-center bg-gradient-to-b from-slate-900 to-slate-950 p-6 text-center">
+      {/* Main Video Viewport: Video element is permanently mounted to receive the camera stream */}
+      <div className="relative w-full h-[380px] sm:h-[460px] bg-slate-950 overflow-hidden flex items-center justify-center">
+        {/* Real Live Camera Video Element */}
+        <video
+          ref={videoRef}
+          autoPlay
+          playsInline
+          muted
+          className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-300 ${
+            cameraActive ? 'opacity-100 z-0' : 'opacity-0 pointer-events-none'
+          }`}
+        />
+
+        {/* Fallback image when camera is off */}
+        {!cameraActive && (
+          <div className="absolute inset-0 w-full h-full flex flex-col items-center justify-center bg-gradient-to-b from-slate-900 to-slate-950 p-6 text-center z-0">
             <img
               src="/src/assets/images/cricket_pitch_action_1791968241773.jpg"
               alt="Live Cricket Pitch Feed"
               referrerPolicy="no-referrer"
-              className="absolute inset-0 w-full h-full object-cover opacity-75"
+              className="absolute inset-0 w-full h-full object-cover opacity-60"
             />
-            <div className="absolute inset-0 bg-gradient-to-t from-slate-950 via-slate-950/40 to-transparent" />
+            <div className="absolute inset-0 bg-gradient-to-t from-slate-950 via-slate-950/60 to-transparent" />
+            <div className="relative z-10 max-w-sm space-y-3">
+              <div className="w-12 h-12 rounded-2xl bg-emerald-500/20 text-emerald-400 flex items-center justify-center mx-auto border border-emerald-500/30">
+                <Camera className="w-6 h-6" />
+              </div>
+              <h3 className="text-sm font-bold text-white">Live Camera Preview</h3>
+              <p className="text-xs text-slate-300">
+                Connect your device camera to record high-FPS deliveries and real-time computer vision ball tracking.
+              </p>
+              <button
+                onClick={() => startCamera()}
+                className="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs uppercase tracking-wider rounded-xl transition-all shadow-lg inline-flex items-center gap-2 cursor-pointer"
+              >
+                <Video className="w-4 h-4" />
+                Start Live Video Feed
+              </button>
+            </div>
           </div>
         )}
 
@@ -400,10 +563,9 @@ export const CameraCaptureStudio: React.FC<CameraCaptureStudioProps> = ({
           className="absolute inset-0 w-full h-full pointer-events-none z-10"
         />
 
-        {/* Calibration Trapezoid Lines Overlay (If in calibrate mode or camera active) */}
+        {/* Calibration Trapezoid Overlay */}
         {(setupStep === 'calibrate' || isCalibrated) && (
           <svg className="absolute inset-0 w-full h-full pointer-events-none z-10 opacity-70">
-            {/* 4-point pitch perspective corridor */}
             <polygon
               points="340,110 460,110 560,420 240,420"
               fill="rgba(56, 189, 248, 0.04)"
@@ -411,12 +573,10 @@ export const CameraCaptureStudio: React.FC<CameraCaptureStudioProps> = ({
               strokeWidth="1.5"
               strokeDasharray="4 4"
             />
-            {/* Bowling Crease Line */}
             <line x1="330" y1="120" x2="470" y2="120" stroke="#10b981" strokeWidth="2" />
             <text x="400" y="105" textAnchor="middle" fill="#10b981" fontSize="10" fontFamily="JetBrains Mono">
               STUMPS DETECTED (20.12m)
             </text>
-            {/* Popping Crease Line */}
             <line x1="260" y1="390" x2="540" y2="390" stroke="#f59e0b" strokeWidth="2" />
             <text x="400" y="410" textAnchor="middle" fill="#f59e0b" fontSize="10" fontFamily="JetBrains Mono">
               BATTING CREASE
@@ -424,32 +584,36 @@ export const CameraCaptureStudio: React.FC<CameraCaptureStudioProps> = ({
           </svg>
         )}
 
-        {/* Live Tracking HUD Pill (Top Left) */}
+        {/* Live Recording HUD Badge (Top Left) */}
         <div className="absolute top-3 left-3 z-20 flex flex-col gap-1.5">
-          <div className="flex items-center gap-2 px-2.5 py-1 rounded-lg bg-slate-950/85 backdrop-blur-md border border-slate-800 text-xs">
-            <div className={`w-2 h-2 rounded-full ${isRecording ? 'bg-red-500 animate-pulse' : 'bg-emerald-400'}`} />
-            <span className="font-mono text-slate-200">
-              {isRecording ? `REC ${formatTimer(elapsedSeconds)}` : 'STANDBY (AUTO-CLIPPING)'}
+          <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-950/90 backdrop-blur-md border border-slate-800 text-xs shadow-lg">
+            <div
+              className={`w-2.5 h-2.5 rounded-full ${
+                isRecording ? 'bg-red-500 animate-ping' : cameraActive ? 'bg-emerald-400' : 'bg-amber-400'
+              }`}
+            />
+            <span className="font-mono text-slate-200 font-bold">
+              {isRecording ? `RECORDING LIVE [${formatTimer(elapsedSeconds)}]` : cameraActive ? 'LIVE CAMERA STREAM' : 'CAMERA STANDBY'}
             </span>
             <span className="text-slate-600">|</span>
             <span className="font-mono text-emerald-400">{fpsMode} FPS</span>
           </div>
 
           {audioTriggerEnabled && (
-            <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-slate-900/80 backdrop-blur-md border border-slate-800 text-[10px] text-slate-300 font-mono">
+            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-900/90 backdrop-blur-md border border-slate-800 text-[10px] text-slate-300 font-mono">
               <Mic className="w-3 h-3 text-sky-400" />
-              <span>Smart Acoustic Pitch Trigger Active</span>
+              <span>Smart Acoustic Pitch Trigger: ACTIVE</span>
             </div>
           )}
         </div>
 
-        {/* Live Detected Delivery Specs Banner (When delivery occurs) */}
+        {/* Live Detected Delivery Specs Banner */}
         {recentDetection && (
-          <div className="absolute top-3 right-3 z-20 p-2.5 rounded-xl bg-slate-950/90 backdrop-blur-md border border-emerald-500/40 shadow-xl text-right animate-in fade-in duration-200">
+          <div className="absolute top-3 right-3 z-20 p-3 rounded-xl bg-slate-950/95 backdrop-blur-md border border-emerald-500/40 shadow-2xl text-right animate-in fade-in duration-200">
             <div className="text-[10px] uppercase font-mono text-emerald-400 font-bold flex items-center justify-end gap-1">
-              <Sparkles className="w-3 h-3" /> BALL #{recentDetection.ballCount} DETECTED
+              <Sparkles className="w-3 h-3" /> BALL #{recentDetection.ballCount} TRACKED
             </div>
-            <div className="text-xl font-bold font-mono text-white tabular-nums">
+            <div className="text-2xl font-bold font-mono text-white tabular-nums">
               {recentDetection.speed} <span className="text-xs text-slate-400">km/h</span>
             </div>
             <div className="text-xs text-slate-300 font-mono">
@@ -461,44 +625,81 @@ export const CameraCaptureStudio: React.FC<CameraCaptureStudioProps> = ({
           </div>
         )}
 
-        {/* Quick Action Overlay (Center bottom button for testing delivery trigger) */}
+        {/* Bottom Floating Trigger Bar */}
         <div className="absolute bottom-4 left-0 right-0 z-20 flex items-center justify-center gap-3 px-4">
+          {/* Main Record Button */}
+          <button
+            onClick={isRecording ? handleStopRecording : handleStartRecording}
+            className={`px-5 py-3 rounded-2xl font-bold text-xs uppercase tracking-wider transition-all shadow-2xl flex items-center gap-2 cursor-pointer ${
+              isRecording
+                ? 'bg-red-600 hover:bg-red-500 text-white shadow-red-600/40 animate-pulse'
+                : 'bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-emerald-500/30 active:scale-95'
+            }`}
+          >
+            {isRecording ? (
+              <>
+                <Square className="w-4 h-4 fill-white" />
+                Stop Recording & Save Clip ({formatTimer(elapsedSeconds)})
+              </>
+            ) : (
+              <>
+                <Video className="w-4 h-4" />
+                Record Live Video Delivery
+              </>
+            )}
+          </button>
+
+          {/* Test CV Delivery Simulation */}
           <button
             onClick={() => triggerDeliveryCapture()}
             disabled={trackingActive}
-            className="px-4 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 active:scale-95 text-slate-950 font-bold text-xs tracking-wider uppercase transition-all shadow-lg flex items-center gap-2 cursor-pointer"
+            className="px-4 py-3 rounded-2xl bg-slate-900/90 hover:bg-slate-800 text-slate-200 border border-slate-700 font-bold text-xs tracking-wider uppercase transition-all shadow-xl flex items-center gap-1.5 cursor-pointer"
+            title="Simulate ball delivery with trajectory lines and speed calculation"
           >
-            <Zap className="w-4 h-4 fill-slate-950" />
-            {trackingActive ? 'Tracking Trajectory...' : 'Trigger CV Ball Delivery'}
+            <Zap className="w-3.5 h-3.5 text-amber-400 fill-amber-400" />
+            <span className="hidden sm:inline">Simulate CV Trajectory</span>
           </button>
         </div>
       </div>
 
       {/* Studio Control Toolbar */}
       <div className="px-4 py-3 bg-slate-950 border-t border-slate-800 flex flex-wrap items-center justify-between gap-3">
-        {/* Recording Toggle */}
+        {/* Camera Device Switcher & Flip */}
         <div className="flex items-center gap-2">
-          <button
-            onClick={() => setIsRecording(!isRecording)}
-            className={`px-3.5 py-1.5 rounded-xl font-medium text-xs flex items-center gap-1.5 transition-colors ${
-              isRecording
-                ? 'bg-red-600 hover:bg-red-500 text-white shadow-lg shadow-red-600/30'
-                : 'bg-slate-800 hover:bg-slate-700 text-slate-200'
-            }`}
-          >
-            {isRecording ? <Square className="w-3.5 h-3.5 fill-white" /> : <Video className="w-3.5 h-3.5" />}
-            {isRecording ? 'Stop Session' : 'Start Auto-Clip'}
-          </button>
+          {availableDevices.length > 1 ? (
+            <select
+              value={selectedDeviceId}
+              onChange={(e) => {
+                setSelectedDeviceId(e.target.value);
+                startCamera(e.target.value);
+              }}
+              className="bg-slate-900 border border-slate-800 text-xs text-slate-200 rounded-xl px-2.5 py-1.5 focus:ring-1 focus:ring-emerald-500"
+            >
+              {availableDevices.map((d, idx) => (
+                <option key={d.deviceId} value={d.deviceId}>
+                  {d.label || `Camera ${idx + 1}`}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <button
+              onClick={() => {
+                setFacingMode((prev) => (prev === 'environment' ? 'user' : 'environment'));
+              }}
+              className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs flex items-center gap-1.5 transition-colors"
+              title="Flip between front and rear cameras"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              <span>Flip Camera ({facingMode === 'environment' ? 'Back' : 'Front'})</span>
+            </button>
+          )}
 
-          {/* Camera Flip Button */}
           <button
-            onClick={() => {
-              setFacingMode((prev) => (prev === 'environment' ? 'user' : 'environment'));
-            }}
-            className="p-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors"
-            title="Switch front/rear camera"
+            onClick={() => startCamera()}
+            className="p-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors"
+            title="Refresh Camera Connection"
           >
-            <RotateCcw className="w-3.5 h-3.5" />
+            <RefreshCw className="w-3.5 h-3.5" />
           </button>
         </div>
 
@@ -522,11 +723,11 @@ export const CameraCaptureStudio: React.FC<CameraCaptureStudioProps> = ({
           </button>
         </div>
 
-        {/* Audio Trigger Toggle */}
+        {/* Audio Pitch Cue Toggle */}
         <div className="flex items-center gap-2">
           <button
             onClick={() => setAudioTriggerEnabled(!audioTriggerEnabled)}
-            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition-colors ${
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium transition-colors ${
               audioTriggerEnabled
                 ? 'bg-sky-500/20 text-sky-400 border border-sky-500/30'
                 : 'bg-slate-800 text-slate-400'
@@ -537,6 +738,61 @@ export const CameraCaptureStudio: React.FC<CameraCaptureStudioProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Recorded Live Video Playback Strip (When video has been recorded) */}
+      {recordedVideosList.length > 0 && (
+        <div className="p-4 bg-slate-950/90 border-t border-slate-800 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Film className="w-4 h-4 text-emerald-400" />
+              <span className="text-xs font-bold uppercase tracking-wider text-white">
+                Recorded Live Delivery Clips ({recordedVideosList.length})
+              </span>
+            </div>
+            <span className="text-[11px] font-mono text-slate-400">
+              Ready for DRS & Biomechanical Review
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {recordedVideosList.slice(0, 2).map((item, idx) => (
+              <div
+                key={item.id}
+                className="p-3 bg-slate-900 rounded-xl border border-slate-800 flex items-center justify-between gap-3"
+              >
+                <div className="flex items-center gap-3">
+                  <div className="w-12 h-12 rounded-lg bg-black overflow-hidden flex items-center justify-center shrink-0 border border-slate-800 relative">
+                    <video src={item.url} className="w-full h-full object-cover" />
+                    <div className="absolute inset-0 bg-black/30 flex items-center justify-center">
+                      <Play className="w-4 h-4 text-white fill-white" />
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-xs font-bold text-white flex items-center gap-2">
+                      <span>Clip #{recordedVideosList.length - idx}</span>
+                      <span className="text-emerald-400 font-mono text-[11px]">{item.speedKmh} km/h</span>
+                    </div>
+                    <div className="text-[11px] text-slate-400 font-mono mt-0.5">
+                      Duration: {item.duration} · {item.timestamp}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-1.5">
+                  <a
+                    href={item.url}
+                    download={`PitchVision_LiveClip_${item.id}.webm`}
+                    className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 transition-colors"
+                    title="Download recorded clip"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                  </a>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 };
